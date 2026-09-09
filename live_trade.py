@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAME = 60
 BASE_STAKE = 40.0  # Initial trade amount in USD
 MARTINGALE_MULTIPLIER = 2.0  # Double the stake for the 1 single Martingale step
-TARGET_STREAK = 5  # Number of consecutive candles needed to trigger a reversal
+TARGET_STREAK = 3 # Number of consecutive candles needed to trigger a reversal
 
 OTC_PAIRS = [
     "USDJPY-OTC",
@@ -35,8 +35,6 @@ OTC_PAIRS = [
     "EURJPY-OTC",
     "GBPJPY-OTC",
 ]
-
-LOCAL_TIMEZONE = timezone(timedelta(hours=1))
 
 # ============================================================
 # VALIDATION
@@ -81,11 +79,8 @@ def send_telegram_message(message):
     }).encode("utf-8")
 
     try:
-        logger.info("Sending to chat_id: %s | Message payload length: %d", TELEGRAM_CHAT_ID, len(message))
         req = urllib.request.Request(url, data=payload, method="POST")
-        logger.info("Request prepared. Sending...")
         with urllib.request.urlopen(req, timeout=10) as response:
-            logger.info("Response received. Processing...")
             res = json.loads(response.read().decode("utf-8"))
             if not res.get("ok"):
                 logger.error("Telegram API rejection: %s", res)
@@ -109,7 +104,27 @@ def connect_iq_option():
     logger.info("Connected successfully. Practice balance: $%.2f", API.get_balance())
     return True
 
+def ensure_connection():
+    """
+    Checks connection status and reconnects automatically if dropped.
+    """
+    global API
+    try:
+        if API is None or not API.check_connect():
+            logger.warning("Socket connection lost. Reconnecting...")
+            success = connect_iq_option()
+            if success:
+                refresh_otc_mappings()
+                return True
+            return False
+        return True
+    except Exception as e:
+        logger.error("Exception during connection check: %s", e)
+        return connect_iq_option()
+
 def refresh_otc_mappings():
+    if API is None:
+        return False
     API.api.api_option_init_all_result = None
     API.api.get_api_option_init_all()
     start = time.time()
@@ -135,10 +150,12 @@ def refresh_otc_mappings():
 
 def place_order_with_timeout(pair, stake, direction, duration=1):
     """
-    Executes a digital spot trade directly with a strict timeout guard.
+    Executes a binary trade with connection validation and timeout guard.
     """
     def _execute():
-        return API.buy_digital_spot(pair, stake, direction, duration)
+        if not ensure_connection():
+            return False, None
+        return API.buy(stake, pair, direction, duration)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_execute)
@@ -153,13 +170,12 @@ def place_order_with_timeout(pair, stake, direction, duration=1):
 
 def execute_trade_with_martingale(pair, direction):
     """
-    Runs asynchronously in a background thread to prevent blocking the main loop.
+    Runs asynchronously in a background thread with fault recovery.
     """
     try:
-        if not API.check_connect():
-            logger.warning("Connection lost. Reconnecting to IQ Option...")
-            if not connect_iq_option():
-                return
+        if not ensure_connection():
+            logger.error("Could not recover connection for trade execution.")
+            return
 
         stake = BASE_STAKE
         logger.info("Executing Trade on %s | Direction: %s | Stake: $%.2f", pair, direction.upper(), stake)
@@ -168,13 +184,13 @@ def execute_trade_with_martingale(pair, direction):
 
         if not check or not order_id:
             logger.error("Order placement failed or timed out for %s.", pair)
-            send_telegram_message(f"❌ <b>Order Failed</b> on {pair}\nCould not place base order (Timeout/Rejected).")
+            send_telegram_message(f"❌ <b>Order Failed</b> on {pair}\nCould not place base order.")
             return
 
         logger.info("Order placed successfully! Order ID: %s. Waiting for result...", order_id)
         send_telegram_message(f"📝 <b>Order Placed Successfully</b>\nMarket: {pair}\nDirection: {direction.upper()}\nStake: ${stake:.2f}\nOrder ID: {order_id}")
 
-        win_result = wait_for_digital_trade_result(order_id)
+        win_result = wait_for_trade_result(order_id)
         
         if win_result == "win":
             logger.info("Trade won on base step.")
@@ -182,7 +198,7 @@ def execute_trade_with_martingale(pair, direction):
             return
 
         elif win_result == "loss":
-            logger.warning("Trade lost on base step. Deploying 1st and final Martingale step...")
+            logger.warning("Trade lost on base step. Deploying Martingale step...")
             send_telegram_message(f"⚠️ <b>LOSS (Base Step)</b>\nMarket: {pair}\nDeploying Martingale step...")
             
             mg_stake = stake * MARTINGALE_MULTIPLIER
@@ -190,13 +206,13 @@ def execute_trade_with_martingale(pair, direction):
                 
             if not check_mg or not mg_order_id:
                 logger.error("Martingale order placement failed or timed out.")
-                send_telegram_message(f"❌ <b>Martingale Order Failed</b> on {pair}\nCould not place Martingale order.")
+                send_telegram_message(f"❌ <b>Martingale Order Failed</b> on {pair}")
                 return
                 
             logger.info("Martingale order placed! Order ID: %s. Waiting for result...", mg_order_id)
             send_telegram_message(f"📝 <b>Martingale Order Placed</b>\nMarket: {pair}\nDirection: {direction.upper()}\nStake: ${mg_stake:.2f}\nOrder ID: {mg_order_id}")
 
-            mg_win_result = wait_for_digital_trade_result(mg_order_id)
+            mg_win_result = wait_for_trade_result(mg_order_id)
             
             if mg_win_result == "win":
                 logger.info("Martingale step recovered successfully.")
@@ -207,34 +223,33 @@ def execute_trade_with_martingale(pair, direction):
     except Exception as e:
         logger.error("Error in trade worker thread: %s", e)
 
-def wait_for_digital_trade_result(order_id):
+def wait_for_trade_result(order_id):
     """
-    Safely polls digital option win/loss status using get_digital_spot_profit.
+    Safely polls trade outcome with automatic reconnection on socket drops.
     """
     start_wait = time.time()
-    while time.time() - start_wait < 90:  # Max 90 seconds timeout
+    while time.time() - start_wait < 90:
         try:
-            # Check digital option profit settlement
-            status, profit = API.get_digital_spot_profit(order_id)
-            if status:
-                if profit is not None:
-                    if profit > 0:
-                        return "win"
-                    else:
-                        return "loss"
+            if not ensure_connection():
+                time.sleep(1)
+                continue
+            
+            check, profit = API.check_win_v3(order_id)
+            if check:
+                if profit > 0:
+                    return "win"
+                else:
+                    return "loss"
         except Exception:
             pass
         time.sleep(1)
-    return "loss"  # Safe fallback if API drops connection frame
+    return "loss"
 
 # ============================================================
 # STREAK ANALYZER LOGIC
 # ============================================================
 
 def get_current_live_streak(candles):
-    """
-    Analyzes completed candles to locate streak color and count.
-    """
     if not candles or len(candles) < 2:
         return "DOJI", 0
         
@@ -274,32 +289,39 @@ def run_bot():
     
     try:
         while True:
+            if not ensure_connection():
+                time.sleep(5)
+                continue
+
             for pair in OTC_PAIRS:
-                candles = API.get_candles(pair, TIMEFRAME, 20, time.time())
-                if not candles:
-                    continue
-                
-                latest_candle = candles[-1]
-                candle_from = int(latest_candle["from"])
-                
-                if candle_from > last_checked_timestamps[pair]:
-                    last_checked_timestamps[pair] = candle_from
+                try:
+                    candles = API.get_candles(pair, TIMEFRAME, 20, time.time())
+                    if not candles:
+                        continue
                     
-                    current_color, streak_count = get_current_live_streak(candles)
-                    logger.info("Pair: %s | Streak: %d %s", pair, streak_count, current_color)
+                    latest_candle = candles[-1]
+                    candle_from = int(latest_candle["from"])
                     
-                    if streak_count >= TARGET_STREAK:
-                        send_telegram_message(f"🔥 <b>Target Streak Found!</b>\nMarket: <b>{pair}</b>\nStreak: <b>{streak_count} {current_color}</b>\nTriggering Reversal Trade...")
+                    if candle_from > last_checked_timestamps[pair]:
+                        last_checked_timestamps[pair] = candle_from
                         
-                        if current_color == "RED":
-                            logger.info("Target RED streak hit on %s. Spawning trade thread (CALL).", pair)
-                            threading.Thread(target=execute_trade_with_martingale, args=(pair, "call"), daemon=True).start()
-                            time.sleep(5)  # Brief buffer to avoid duplicate triggers on the same candle
+                        current_color, streak_count = get_current_live_streak(candles)
+                        logger.info("Pair: %s | Streak: %d %s", pair, streak_count, current_color)
+                        
+                        if streak_count >= TARGET_STREAK:
+                            send_telegram_message(f"🔥 <b>Target Streak Found!</b>\nMarket: <b>{pair}</b>\nStreak: <b>{streak_count} {current_color}</b>\nTriggering Reversal Trade...")
                             
-                        elif current_color == "GREEN":
-                            logger.info("Target GREEN streak hit on %s. Spawning trade thread (PUT).", pair)
-                            threading.Thread(target=execute_trade_with_martingale, args=(pair, "put"), daemon=True).start()
-                            time.sleep(5)  # Brief buffer to avoid duplicate triggers on the same candle
+                            if current_color == "RED":
+                                logger.info("Target RED streak hit on %s. Spawning trade thread (CALL).", pair)
+                                threading.Thread(target=execute_trade_with_martingale, args=(pair, "call"), daemon=True).start()
+                                time.sleep(5)
+                                
+                            elif current_color == "GREEN":
+                                logger.info("Target GREEN streak hit on %s. Spawning trade thread (PUT).", pair)
+                                threading.Thread(target=execute_trade_with_martingale, args=(pair, "put"), daemon=True).start()
+                                time.sleep(5)
+                except Exception as ex:
+                    logger.error("Error checking candles for %s: %s", pair, ex)
                             
             time.sleep(5)
             
