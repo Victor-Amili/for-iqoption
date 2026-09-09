@@ -1,0 +1,10 @@
+// if using git bash 
+cd ~/Documents/sandboxes/firefly-ai
+source .venv/Scripts/activate
+
+// run your project
+python bot.py
+
+
+// stop your project
+deactivate

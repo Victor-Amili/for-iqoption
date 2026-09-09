@@ -1,0 +1,18 @@
+astroid==4.0.4
+certifi==2026.7.22
+charset-normalizer==3.5.1
+colorama==0.4.6
+dill==0.4.1
+idna==3.19
+iqoptionapi @ https://github.com/iqoptionapi/iqoptionapi/archive/refs/heads/master.zip#sha256=25326cba8e21bc3bb082ab2bd21282f435ce25589d89499a92e1879559c4ca42
+isort==9.0.1
+mccabe==0.7.0
+mypy_extensions==1.1.0
+platformdirs==4.11.7
+pylint==4.0.8
+python-dotenv==1.2.3
+requests==2.34.2
+six==1.17.0
+tomlkit==0.15.1
+urllib3==2.7.0
+websocket-client==0.56.0
