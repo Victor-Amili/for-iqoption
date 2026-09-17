@@ -259,7 +259,7 @@ def run_master_backtest():
 
     for pair in OTC_PAIRS:
         logger.info("Fetching historical data for %s...", pair)
-        candles = API.get_candles(pair, 60, 600, time.time())
+        candles = API.get_candles(pair, 60, 6000, time.time())
         if not candles or len(candles) < 150:
             continue
             
