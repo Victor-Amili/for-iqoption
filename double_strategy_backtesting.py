@@ -22,7 +22,6 @@ OTC_PAIRS = [
 
 INITIAL_BALANCE = 1000.0  # Starting virtual balance for backtest
 BASE_STAKE = 40.0
-MARTINGALE_MULTIPLIER = 2.0
 PAYOUT_RATE = 0.82  # Estimated average OTC payout (82%)
 
 logging.basicConfig(
@@ -116,7 +115,6 @@ def calc_strategy_2_df(candles):
     
     upper_band = [0.0] * len(df)
     lower_band = [0.0] * len(df)
-    super_trend = [0.0] * len(df)
     direction = [1] * len(df)
     
     for i in range(1, len(df)):
@@ -156,26 +154,23 @@ def calc_strategy_2_df(candles):
     return df
 
 # ============================================================
-# BACKTEST EXECUTION ENGINE
+# BACKTEST EXECUTION ENGINE (FIXED STAKE)
 # ============================================================
 
 def run_backtest_for_strategy(api, strategy_num):
     logger.info("==============================================")
-    logger.info("RUNNING BACKTEST FOR STRATEGY %d", strategy_num)
+    logger.info("RUNNING BACKTEST FOR STRATEGY %d (NO MARTINGALE)", strategy_num)
     logger.info("==============================================")
     
     balance = INITIAL_BALANCE
     total_trades = 0
     wins = 0
     losses = 0
-    martingale_wins = 0
-    martingale_losses = 0
     
     duration = 1 if strategy_num == 1 else 5
     
     for pair in OTC_PAIRS:
         logger.info("Fetching historical candles for %s...", pair)
-        # Fetching maximum allowable candles (e.g., 1000 candles)
         candles = api.get_candles(pair, 60, 1000, time.time())
         if not candles or len(candles) < 150:
             logger.warning("Insufficient data for %s", pair)
@@ -201,7 +196,6 @@ def run_backtest_for_strategy(api, strategy_num):
             # Strategy 2 Signal Logic
             elif strategy_num == 2:
                 prev = df.iloc[i-1]
-                # Check MACD histogram count condition
                 hist_count = 0
                 for idx in range(i, -1, -1):
                     h = df['histogram'].iloc[idx]
@@ -225,54 +219,33 @@ def run_backtest_for_strategy(api, strategy_num):
                 entry_price = row['close']
                 exit_price = df.iloc[i + duration]['close']
                 
-                # Evaluate Base Trade
-                base_win = False
+                trade_win = False
                 if signal == "call" and exit_price > entry_price:
-                    base_win = True
+                    trade_win = True
                 elif signal == "put" and exit_price < entry_price:
-                    base_win = True
+                    trade_win = True
                 
-                if base_win:
+                if trade_win:
                     wins += 1
                     balance += BASE_STAKE * PAYOUT_RATE
-                    i += duration  # Skip ahead by expiry duration
                 else:
                     losses += 1
                     balance -= BASE_STAKE
-                    
-                    # Deploy Martingale Step
-                    mg_index = i + duration
-                    if mg_index + duration < len(df):
-                        mg_entry = df.iloc[mg_index]['close']
-                        mg_exit = df.iloc[mg_index + duration]['close']
-                        mg_stake = BASE_STAKE * MARTINGALE_MULTIPLIER
-                        
-                        mg_win = False
-                        if signal == "call" and mg_exit > mg_entry:
-                            mg_win = True
-                        elif signal == "put" and mg_exit < mg_entry:
-                            mg_win = True
-                            
-                        if mg_win:
-                            martingale_wins += 1
-                            balance += mg_stake * PAYOUT_RATE
-                        else:
-                            martingale_losses += 1
-                            balance -= mg_stake
-                            
-                        i = mg_index + duration
-                    else:
-                        i += duration
+                
+                # Advance forward by the trade duration
+                i += duration
             else:
                 i += 1
 
-    logger.info("--- STRATEGY %d RESULTS SUMMARY ---", strategy_num)
-    logger.info("Total Signals Taken: %d", total_trades)
-    logger.info("Base Wins: %d | Base Losses: %d", wins, losses)
-    logger.info("Martingale Recoveries: %d | Unrecovered Sequences: %d", martingale_wins, martingale_losses)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+
+    logger.info("--- STRATEGY %d RESULTS SUMMARY (NO MARTINGALE) ---", strategy_num)
+    logger.info("Total Trades Taken: %d", total_trades)
+    logger.info("Wins: %d | Losses: %d", wins, losses)
+    logger.info("Win Rate: %.2f%%", win_rate)
     logger.info("Starting Balance: $%.2f", INITIAL_BALANCE)
     logger.info("Final Equity Balance: $%.2f (Net Profit: $%.2f)", balance, balance - INITIAL_BALANCE)
-    logger.info("----------------------------------------------\n")
+    logger.info("----------------------------------------------------\n")
 
 def main():
     api = connect_iq()
@@ -280,7 +253,6 @@ def main():
         return
     refresh_mappings(api)
     
-    # Run backtests for both strategies
     run_backtest_for_strategy(api, strategy_num=1)
     run_backtest_for_strategy(api, strategy_num=2)
 
