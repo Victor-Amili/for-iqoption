@@ -70,7 +70,7 @@ from pocketoptionapi_async import AsyncPocketOptionClient
 SSID_PAYLOAD = '42["auth",{"session": "itd3dnrfo38am7lbldeqklppph", "isDemo": 1, "uid": 131006989, "platform": 2, "isFastHistory": true}]'
 
 # Strategy Settings
-STREAK_COUNT = 3      # Number of consecutive candles needed
+STREAK_COUNT = 7      # Number of consecutive candles needed
 TRADE_AMOUNT = 1      # Demo stake in USD
 EXPIRATION_TIME = 60  # Trade duration in seconds (1 min)
 ASSET = 'EURUSD_otc'
