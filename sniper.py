@@ -20,8 +20,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STARTING_BALANCE = 10.0 
-STAKE_PERCENTAGE = 0.10  # 10% of current balance per trade
 
+# Proven Core 4-Pair Basket
 OTC_PAIRS = [
     "USDJPY-OTC",
     "AUDUSD-OTC",
@@ -47,7 +47,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("FIREFLY-SNIPER-PERCENT")
+logger = logging.getLogger("FIREFLY-ADX-SCALING")
 
 API = None
 
@@ -120,7 +120,7 @@ def fetch_candle_history(pair, timeframe, total_needed=20000):
     return all_candles
 
 # ============================================================
-# HTF-FILTERED SNIPER EVALUATION
+# ADX CONFIDENCE-SCALED EVALUATION
 # ============================================================
 
 def evaluate_htf_filtered_signals(candles):
@@ -138,10 +138,8 @@ def evaluate_htf_filtered_signals(candles):
         'close': 'last'
     }).dropna()
     
-    # Calculate 1H 50 EMA
     df_1h['ema50_1h'] = df_1h['close'].ewm(span=50, adjust=False).mean()
     
-    # Map 1H trend back to 15m dataframe using forward-fill
     df_1h_reset = df_1h.reset_index()
     df = pd.merge_asof(df.sort_values('datetime'), df_1h_reset[['datetime', 'ema50_1h', 'close']], on='datetime', direction='backward')
     df = df.rename(columns={'close_x': 'close', 'close_y': 'close_1h'})
@@ -172,15 +170,12 @@ def evaluate_htf_filtered_signals(candles):
     for i in range(60, len(df)):
         row = df.iloc[i]
         
-        # 1. Balanced Trend Check (ADX > 24)
         if row['adx'] <= 24:
             continue
             
-        # 2. Avoid dead/doji candles (body must be at least 35% of average size)
         if row['body_size'] < (0.35 * row['avg_body']):
             continue
 
-        # Strategy 4: EMA Cross
         ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i]
         ema21 = df['close'].ewm(span=21, adjust=False).mean().iloc[i]
         prev_ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i-1]
@@ -192,7 +187,6 @@ def evaluate_htf_filtered_signals(candles):
         elif ema9 < ema21 and prev_ema9 >= prev_ema21:
             s4 = 'put'
 
-        # Strategy 7: MA Pullback Pin Bar
         sma50_val = row['sma50']
         sma50_prev = df['sma50'].iloc[i-2]
         lower_wick = min(row['open'], row['close']) - row['low']
@@ -206,7 +200,6 @@ def evaluate_htf_filtered_signals(candles):
             if upper_wick >= (1.2 * row['body_size']):
                 s7 = 'put'
 
-        # 3. Flexible Window Confluence
         recent_s4 = s4
         recent_s7 = s7
         if recent_s4 is None and i > 0:
@@ -221,8 +214,6 @@ def evaluate_htf_filtered_signals(candles):
 
         if recent_s4 is not None and recent_s7 is not None and recent_s4 == recent_s7:
             candidate_sig = recent_s4
-            
-            # 4. Higher Timeframe (1H) Macro Filter
             htf_close = row['close_1h']
             htf_ema = row['ema50_1h']
             
@@ -238,17 +229,18 @@ def evaluate_htf_filtered_signals(candles):
 # EXECUTION
 # ============================================================
 
-def run_percent_backtest():
+def run_adx_scaling_backtest():
     if not connect_iq_option():
         return
     refresh_otc_mappings()
     
-    send_telegram_message("📈 <b>Percent-Stake Sniper Backtest Started</b>\nStarting Balance: $10.00 | Risk: 10% per trade (Compounding)...")
+    send_telegram_message("⚡ <b>ADX Confidence-Scaled Backtest Started</b>\nStarting Balance: $10.00 | Dynamic Risk (20% standard / 40% high ADX)...")
 
     payout_rate = 0.82 
     total_trades = 0
     wins = 0
     losses = 0
+    high_conviction_trades = 0
     balance = STARTING_BALANCE
 
     for pair in OTC_PAIRS:
@@ -261,10 +253,18 @@ def run_percent_backtest():
         for i in range(60, len(df) - 1):
             sig = df.loc[i, 'htf_signal']
             if sig is not None:
-                # Dynamic 10% stake calculation per trade
-                stake = balance * STAKE_PERCENTAGE
+                adx_val = df.loc[i, 'adx']
+                
+                # Dynamic risk sizing based on trend strength (ADX)
+                if adx_val > 35:
+                    stake_pct = 0.40  # 40% risk on hyper-strong trends
+                    high_conviction_trades += 1
+                else:
+                    stake_pct = 0.20  # 20% standard compounding risk
+                
+                stake = balance * stake_pct
                 if stake < 1.0:
-                    stake = 1.0  # broker minimum safety floor
+                    stake = 1.0  
                 
                 entry_close = df.loc[i, 'close']
                 exit_close = df.loc[i+1, 'close']
@@ -283,9 +283,9 @@ def run_percent_backtest():
     profit = balance - STARTING_BALANCE
 
     report = (
-        f"📈 <b>FIREFLY PERCENT-STAKE RESULTS</b>\n\n"
+        f"🔥 <b>FIREFLY ADX SCALING RESULTS</b>\n\n"
         f"• Timeframe: {TIMEFRAME_NAME} (5k Candles/Pair)\n"
-        f"• Total Trades: <b>{total_trades}</b>\n"
+        f"• Total Trades: <b>{total_trades}</b> (High ADX Conviction: {high_conviction_trades})\n"
         f"• Wins: {wins} | Losses: {losses}\n"
         f"• Win Percentage: <b>{win_rate:.2f}%</b>\n"
         f"• Starting Balance: ${STARTING_BALANCE:.2f}\n"
@@ -295,7 +295,7 @@ def run_percent_backtest():
     )
 
     send_telegram_message(report)
-    logger.info("Percent-Stake Sniper backtest complete. Dispatched to Telegram.")
+    logger.info("ADX-Scaled Backtest complete. Dispatched to Telegram.")
 
 if __name__ == "__main__":
-    run_percent_backtest()
+    run_adx_scaling_backtest()
