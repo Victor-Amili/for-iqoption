@@ -118,28 +118,30 @@ async def run_streak_strategy(client, asset):
         print(f"No {STREAK_COUNT}-candle streak found. Waiting for next check...")
 
 async def main():
-    print("Connecting to Pocket Option Demo...")
-    client = AsyncPocketOptionClient(SSID_PAYLOAD, is_demo=True, enable_logging=False)
-    
-    try:
-        await client.connect()
-        balance = await client.get_balance()
-        print(f"Connected | Demo Balance: ${balance.balance} {balance.currency}\n")
+    while True: # Outer loop for auto-reconnection
+        print("\nConnecting to Pocket Option Demo...")
+        client = AsyncPocketOptionClient(SSID_PAYLOAD, is_demo=True, enable_logging=False)
         
-        # Continuous loop
-        while True:
-            await run_streak_strategy(client, asset=ASSET)
-            print("-" * 40)
+        try:
+            await client.connect()
+            balance = await client.get_balance()
+            print(f"Connected | Demo Balance: ${balance.balance} {balance.currency}\n")
             
-            # Wait for 60 seconds before checking the next candle close
-            await asyncio.sleep(60)
-            
-    except Exception as exc:
-        print(f"An error occurred: {exc}")
-        
-    finally:
-        await client.disconnect()
-        print("\nDisconnected safely.")
+            # Inner strategy loop
+            while True:
+                await run_streak_strategy(client, asset=ASSET)
+                print("-" * 40)
+                await asyncio.sleep(60)
+                
+        except Exception as exc:
+            print(f"Connection lost or error occurred: {exc}")
+            print("Attempting to reconnect in 10 seconds...")
+            try:
+                await client.disconnect()
+                print("\nDisconnected safely.")
+            except:
+                pass
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
