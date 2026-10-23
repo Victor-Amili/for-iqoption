@@ -1,13 +1,14 @@
 import sqlite3
 import pandas as pd
+import numpy as np
 
 DB_NAME = 'market_data.db'
 ASSET = 'EURUSD_otc'
-STREAK_COUNT = 3
-EMA_FAST = 20
-EMA_SLOW = 50
-RSI_PERIOD = 14
-PAYOUT_RATE = 0.92
+
+# Bollinger Band Strategy Parameters
+BB_PERIOD = 20         # Moving average period
+BB_STD = 2.0           # Standard deviation multiplier
+PAYOUT_RATE = 0.92     # 92% payout
 STAKE = 1.0
 
 def load_data_from_db():
@@ -16,69 +17,65 @@ def load_data_from_db():
     df = pd.read_sql_query(query, conn, params=(ASSET,))
     conn.close()
     
-    # Convert timestamp back to datetime index
     df['datetime'] = pd.to_datetime(df['time'], unit='s')
     df.set_index('datetime', inplace=True)
     return df
 
-def calculate_indicators(df):
-    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+def calculate_bollinger_bands(df):
+    """Calculates Bollinger Bands and checks for extreme breakouts."""
+    # Middle Band (Simple Moving Average)
+    df['sma'] = df['close'].rolling(window=BB_PERIOD).mean()
     
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+    # Standard Deviation
+    df['std'] = df['close'].rolling(window=BB_PERIOD).std()
     
-    df['is_green'] = df['close'] > df['open']
-    df['is_red'] = df['close'] < df['open']
+    # Upper and Lower Bands
+    df['upper_band'] = df['sma'] + (df['std'] * BB_STD)
+    df['lower_band'] = df['sma'] - (df['std'] * BB_STD)
+    
     return df
 
 def run_backtest():
     df = load_data_from_db()
-    if len(df) < EMA_SLOW + STREAK_COUNT:
+    if len(df) < BB_PERIOD + 2:
         print(f"Not enough data in database yet. Current rows: {len(df)}")
         return
 
-    print(f"Loaded {len(df)} candles from SQLite database. Running backtest...\n")
-    df = calculate_indicators(df)
+    print(f"Loaded {len(df)} candles from SQLite database. Running Bollinger Band Mean Reversion backtest...\n")
+    df = calculate_bollinger_bands(df)
     
     wins = 0
     losses = 0
     total_profit = 0.0
     trades_executed = 0
 
-    start_index = max(EMA_SLOW, STREAK_COUNT + 1)
+    # Start after the BB warmup period
+    start_index = BB_PERIOD
     
     for i in range(start_index, len(df) - 1):
-        window = df.iloc[i - STREAK_COUNT : i]
         current_row = df.iloc[i]
         next_row = df.iloc[i + 1]
         
-        all_green = all(window['is_green'])
-        all_red = all(window['is_red'])
-        
-        if not all_green and not all_red:
-            continue
-            
-        trend_bullish = current_row['ema_fast'] > current_row['ema_slow']
-        trend_bearish = current_row['ema_fast'] < current_row['ema_slow']
-        
-        rsi_ok_call = current_row['rsi'] < 70
-        rsi_ok_put = current_row['rsi'] > 30
+        close_price = current_row['close']
+        upper = current_row['upper_band']
+        lower = current_row['lower_band']
         
         signal = None
-        if all_green and trend_bullish and rsi_ok_call:
-            signal = "call"
-        elif all_red and trend_bearish and rsi_ok_put:
+        
+        # Mean Reversion Trigger:
+        # If price closes ABOVE the upper band, fade it with a PUT (expecting drop back inside)
+        if close_price > upper:
             signal = "put"
+        # If price closes BELOW the lower band, fade it with a CALL (expecting bounce back inside)
+        elif close_price < lower:
+            signal = "call"
             
         if signal:
             trades_executed += 1
             next_is_green = next_row['close'] > next_row['open']
             next_is_red = next_row['close'] < next_row['open']
             
+            # Evaluate 1-minute expiration outcome
             if (signal == "call" and next_is_green) or (signal == "put" and next_is_red):
                 wins += 1
                 total_profit += (STAKE * PAYOUT_RATE)
@@ -86,9 +83,10 @@ def run_backtest():
                 losses += 1
                 total_profit -= STAKE
 
-    print("=" * 45)
-    print("       DATABASE BACKTEST RESULTS REPORT       ")
-    print("=" * 45)
+    # Print Results Report
+    print("=" * 50)
+    print("   BOLLINGER BAND MEAN REVERSION BACKTEST REPORT   ")
+    print("=" * 50)
     print(f"Asset Evaluated       : {ASSET}")
     print(f"Total Candles Scanned : {len(df)}")
     print(f"Total Trades Triggered: {trades_executed}")
@@ -105,8 +103,8 @@ def run_backtest():
         else:
             print("Status                : 🔴 UNPROFITABLE (Needs tuning)")
     else:
-        print("Status                : No trades triggered with current filters.")
-    print("=" * 45)
+        print("Status                : No trades triggered with current band settings.")
+    print("=" * 50)
 
 if __name__ == "__main__":
     run_backtest()
