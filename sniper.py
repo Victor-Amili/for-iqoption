@@ -1,301 +1,132 @@
-import os
-import sys
-import time
-import json
-import logging
-import urllib.parse
-import urllib.request
-
+import sqlite3
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
-from iqoptionapi.stable_api import IQ_Option
-import iqoptionapi.stable_api as stable_api
 
-load_dotenv()
+DB_NAME = 'market_data.db'
+ASSET = 'EURUSD_otc'
 
-OWNER_EMAIL = os.getenv("OWNER_EMAIL")
-OWNER_PASSWORD = os.getenv("OWNER_PASSWORD")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Strategy Parameters
+EMA_FAST = 9
+EMA_SLOW = 21
+EMA_5M_PERIOD = 20     # 5-Minute Trend Filter Period
+PAYOUT_RATE = 0.92     
+STAKE = 1.0
 
-STARTING_BALANCE = 10.0 
-
-# Proven Core 4-Pair Basket
-OTC_PAIRS = [
-    "USDJPY-OTC",
-    "AUDUSD-OTC",
-    "EURJPY-OTC",
-    "GBPJPY-OTC",
-]
-
-TIMEFRAME_SEC = 900 
-TIMEFRAME_NAME = "15-Minute"
-
-for var_name, val in [
-    ("OWNER_EMAIL", OWNER_EMAIL),
-    ("OWNER_PASSWORD", OWNER_PASSWORD),
-    ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
-    ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
-]:
-    if not val:
-        print(f"ERROR: {var_name} is missing from .env")
-        sys.exit(1)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("FIREFLY-ADX-SCALING")
-
-API = None
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }).encode("utf-8")
-    try:
-        req = urllib.request.Request(url, data=payload, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            if not res.get("ok"):
-                logger.error("Telegram API rejection: %s", res)
-    except Exception as exc:
-        logger.error("Failed to send Telegram notification: %s", exc)
-
-def connect_iq_option():
-    global API
-    logger.info("Connecting to IQ Option...")
-    API = IQ_Option(OWNER_EMAIL, OWNER_PASSWORD)
-    check, reason = API.connect()
-    if not check:
-        logger.error("Connection failed: %s", reason)
-        return False
-    logger.info("Connected successfully.")
-    return True
-
-def refresh_otc_mappings():
-    if API is None:
-        return False
-    API.api.api_option_init_all_result = None
-    API.api.get_api_option_init_all()
-    start = time.time()
-    while API.api.api_option_init_all_result is None and time.time() - start < 30:
-        time.sleep(0.1)
-        
-    result = API.api.api_option_init_all_result
-    if result and result.get("isSuccessful"):
-        result_data = result.get("result", {})
-        for market_type in ("binary", "turbo"):
-            actives = result_data.get(market_type, {}).get("actives", {})
-            for active_id, active_data in actives.items():
-                raw_name = active_data.get("name", "")
-                asset_name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
-                if asset_name in OTC_PAIRS:
-                    stable_api.OP_code.ACTIVES[asset_name] = int(active_id)
-    return True
-
-def fetch_candle_history(pair, timeframe, total_needed=20000):
-    all_candles = []
-    end_time = time.time()
-    chunk_size = 1000
+def load_data_from_db():
+    conn = sqlite3.connect(DB_NAME)
+    query = "SELECT time, open, high, low, close FROM candles WHERE asset = ? ORDER BY time ASC"
+    df = pd.read_sql_query(query, conn, params=(ASSET,))
+    conn.close()
     
-    while len(all_candles) < total_needed:
-        remaining = total_needed - len(all_candles)
-        current_count = min(chunk_size, remaining)
-        
-        logger.info(f"Fetching chunk for {pair} - Current total: {len(all_candles)}/{total_needed}")
-        candles = API.get_candles(pair, timeframe, current_count, end_time)
-        if not candles:
-            break
-            
-        all_candles = candles + all_candles
-        end_time = candles[0]['from'] - 1
-        time.sleep(0.2)
-        
-    return all_candles
+    df['datetime'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('datetime', inplace=True)
+    return df
 
-# ============================================================
-# ADX CONFIDENCE-SCALED EVALUATION
-# ============================================================
-
-def evaluate_htf_filtered_signals(candles):
-    df = pd.DataFrame(candles)
-    df = df.rename(columns={'min': 'low', 'max': 'high'})
-    for col in ['open', 'close', 'high', 'low']:
-        df[col] = df[col].astype(float)
-        
-    # --- Build 1-Hour Higher Timeframe Trend Indicator ---
-    df['datetime'] = pd.to_datetime(df['from'], unit='s')
-    df_1h = df.set_index('datetime').resample('1h').agg({
+def add_multitimeframe_indicators(df):
+    # 1. Calculate 1-Minute Triggers (EMA Crossover)
+    df['ema_fast_1m'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow_1m'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    
+    # 2. Aggregate 1-Minute candles into 5-Minute candles
+    df_5m = df.resample('5min').agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',
         'close': 'last'
     }).dropna()
     
-    df_1h['ema50_1h'] = df_1h['close'].ewm(span=50, adjust=False).mean()
+    # Calculate 5-Minute Trend Indicator
+    df_5m['ema_5m'] = df_5m['close'].ewm(span=EMA_5M_PERIOD, adjust=False).mean()
+    df_5m['bullish_5m'] = df_5m['close'] > df_5m['ema_5m']
+    df_5m['bearish_5m'] = df_5m['close'] < df_5m['ema_5m']
     
-    df_1h_reset = df_1h.reset_index()
-    df = pd.merge_asof(df.sort_values('datetime'), df_1h_reset[['datetime', 'ema50_1h', 'close']], on='datetime', direction='backward')
-    df = df.rename(columns={'close_x': 'close', 'close_y': 'close_1h'})
-
-    # Indicators (15m)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift(1)).abs()
-    tr3 = (df['low'] - df['close'].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr14 = tr.rolling(14).mean()
+    # SHIFT by 1 to prevent lookahead bias (ensures 1m trades only look at CLOSED 5m candles)
+    df_5m['locked_bullish_5m'] = df_5m['bullish_5m'].shift(1)
+    df_5m['locked_bearish_5m'] = df_5m['bearish_5m'].shift(1)
     
-    up_move = df['high'] - df['high'].shift(1)
-    down_move = df['low'].shift(1) - df['low']
-    p_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    m_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    # Map 5-minute states back to the 1-minute dataframe
+    df['5m_block'] = df.index.floor('5min')
+    df = df.merge(df_5m[['locked_bullish_5m', 'locked_bearish_5m']], left_on='5m_block', right_index=True, how='left')
     
-    p_di = 100 * pd.Series(p_dm).rolling(14).mean() / (atr14 + 1e-9)
-    m_di = 100 * pd.Series(m_dm).rolling(14).mean() / (atr14 + 1e-9)
-    dx = 100 * (p_di - m_di).abs() / (p_di + m_di + 1e-9)
-    df['adx'] = dx.rolling(14).mean()
-
-    df['body_size'] = (df['close'] - df['open']).abs()
-    df['avg_body'] = df['body_size'].rolling(20).mean()
-    df['sma50'] = df['close'].rolling(50).mean()
-
-    df['htf_signal'] = None
-
-    for i in range(60, len(df)):
-        row = df.iloc[i]
-        
-        if row['adx'] <= 24:
-            continue
-            
-        if row['body_size'] < (0.35 * row['avg_body']):
-            continue
-
-        ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i]
-        ema21 = df['close'].ewm(span=21, adjust=False).mean().iloc[i]
-        prev_ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i-1]
-        prev_ema21 = df['close'].ewm(span=21, adjust=False).mean().iloc[i-1]
-        
-        s4 = None
-        if ema9 > ema21 and prev_ema9 <= prev_ema21:
-            s4 = 'call'
-        elif ema9 < ema21 and prev_ema9 >= prev_ema21:
-            s4 = 'put'
-
-        sma50_val = row['sma50']
-        sma50_prev = df['sma50'].iloc[i-2]
-        lower_wick = min(row['open'], row['close']) - row['low']
-        upper_wick = row['high'] - max(row['open'], row['close'])
-        
-        s7 = None
-        if sma50_val > sma50_prev and row['low'] <= sma50_val and row['close'] > sma50_val:
-            if lower_wick >= (1.2 * row['body_size']):
-                s7 = 'call'
-        elif sma50_val < sma50_prev and row['high'] >= sma50_val and row['close'] < sma50_val:
-            if upper_wick >= (1.2 * row['body_size']):
-                s7 = 'put'
-
-        recent_s4 = s4
-        recent_s7 = s7
-        if recent_s4 is None and i > 0:
-            p_ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i-1]
-            p_ema21 = df['close'].ewm(span=21, adjust=False).mean().iloc[i-1]
-            pp_ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[i-2]
-            pp_ema21 = df['close'].ewm(span=21, adjust=False).mean().iloc[i-2]
-            if p_ema9 > p_ema21 and pp_ema9 <= pp_ema21:
-                recent_s4 = 'call'
-            elif p_ema9 < p_ema21 and pp_ema9 >= pp_ema21:
-                recent_s4 = 'put'
-
-        if recent_s4 is not None and recent_s7 is not None and recent_s4 == recent_s7:
-            candidate_sig = recent_s4
-            htf_close = row['close_1h']
-            htf_ema = row['ema50_1h']
-            
-            if pd.notna(htf_close) and pd.notna(htf_ema):
-                if candidate_sig == 'call' and htf_close > htf_ema:
-                    df.loc[i, 'htf_signal'] = 'call'
-                elif candidate_sig == 'put' and htf_close < htf_ema:
-                    df.loc[i, 'htf_signal'] = 'put'
-
     return df
 
-# ============================================================
-# EXECUTION
-# ============================================================
-
-def run_adx_scaling_backtest():
-    if not connect_iq_option():
+def run_backtest():
+    df = load_data_from_db()
+    if len(df) < 100:
+        print(f"Not enough data in database yet. Current rows: {len(df)}")
         return
-    refresh_otc_mappings()
-    
-    send_telegram_message("⚡ <b>ADX Confidence-Scaled Backtest Started</b>\nStarting Balance: $10.00 | Dynamic Risk (20% standard / 40% high ADX)...")
 
-    payout_rate = 0.82 
-    total_trades = 0
+    print(f"Loaded {len(df)} candles from SQLite. Running Multi-Timeframe (1M + 5M) backtest...\n")
+    df = add_multitimeframe_indicators(df)
+    
     wins = 0
     losses = 0
-    high_conviction_trades = 0
-    balance = STARTING_BALANCE
+    total_profit = 0.0
+    trades_executed = 0
 
-    for pair in OTC_PAIRS:
-        candles = fetch_candle_history(pair, TIMEFRAME_SEC, total_needed=5000)
-        if not candles or len(candles) < 200:
+    start_index = 50 # Warmup buffer
+    
+    for i in range(start_index, len(df) - 1):
+        prev_row = df.iloc[i - 1]
+        current_row = df.iloc[i]
+        next_row = df.iloc[i + 1]
+        
+        # Skip if 5-minute data hasn't locked in yet
+        if pd.isna(current_row['locked_bullish_5m']):
             continue
             
-        df = evaluate_htf_filtered_signals(candles)
+        # 1-Minute Trigger: EMA Crossover
+        fast_above_slow_now = current_row['ema_fast_1m'] > current_row['ema_slow_1m']
+        fast_above_slow_prev = prev_row['ema_fast_1m'] > prev_row['ema_slow_1m']
+        
+        bullish_cross_1m = not fast_above_slow_prev and fast_above_slow_now
+        bearish_cross_1m = fast_above_slow_prev and not fast_above_slow_now
+        
+        # 5-Minute Higher Timeframe Confirmation Filter
+        confirm_bullish_5m = current_row['locked_bullish_5m']
+        confirm_bearish_5m = current_row['locked_bearish_5m']
+        
+        signal = None
+        
+        # MTF Confluence Rule: 1M Crossover MUST align with 5M Trend Direction
+        if bullish_cross_1m and confirm_bullish_5m:
+            signal = "call"
+        elif bearish_cross_1m and confirm_bearish_5m:
+            signal = "put"
+            
+        if signal:
+            trades_executed += 1
+            next_is_green = next_row['close'] > next_row['open']
+            next_is_red = next_row['close'] < next_row['open']
+            
+            if (signal == "call" and next_is_green) or (signal == "put" and next_is_red):
+                wins += 1
+                total_profit += (STAKE * PAYOUT_RATE)
+            else:
+                losses += 1
+                total_profit -= STAKE
 
-        for i in range(60, len(df) - 1):
-            sig = df.loc[i, 'htf_signal']
-            if sig is not None:
-                adx_val = df.loc[i, 'adx']
-                
-                # Dynamic risk sizing based on trend strength (ADX)
-                if adx_val > 35:
-                    stake_pct = 0.40  # 40% risk on hyper-strong trends
-                    high_conviction_trades += 1
-                else:
-                    stake_pct = 0.20  # 20% standard compounding risk
-                
-                stake = balance * stake_pct
-                if stake < 1.0:
-                    stake = 1.0  
-                
-                entry_close = df.loc[i, 'close']
-                exit_close = df.loc[i+1, 'close']
-                
-                is_win = (sig == 'call' and exit_close > entry_close) or (sig == 'put' and exit_close < entry_close)
-                
-                total_trades += 1
-                if is_win:
-                    wins += 1
-                    balance += stake * payout_rate
-                else:
-                    losses += 1
-                    balance -= stake
-
-    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
-    profit = balance - STARTING_BALANCE
-
-    report = (
-        f"🔥 <b>FIREFLY ADX SCALING RESULTS</b>\n\n"
-        f"• Timeframe: {TIMEFRAME_NAME} (5k Candles/Pair)\n"
-        f"• Total Trades: <b>{total_trades}</b> (High ADX Conviction: {high_conviction_trades})\n"
-        f"• Wins: {wins} | Losses: {losses}\n"
-        f"• Win Percentage: <b>{win_rate:.2f}%</b>\n"
-        f"• Starting Balance: ${STARTING_BALANCE:.2f}\n"
-        f"• Final Balance: <b>${balance:.2f}</b>\n"
-        f"• Total P/L: <b>${profit:+.2f}</b>\n"
-        f"-----------------------------------"
-    )
-
-    send_telegram_message(report)
-    logger.info("ADX-Scaled Backtest complete. Dispatched to Telegram.")
+    print("=" * 55)
+    print("    MULTI-TIMEFRAME (1M + 5M) BACKTEST REPORT       ")
+    print("=" * 55)
+    print(f"Asset Evaluated       : {ASSET}")
+    print(f"Total Candles Scanned : {len(df)}")
+    print(f"Total Trades Triggered: {trades_executed}")
+    if trades_executed > 0:
+        win_rate = (wins / trades_executed) * 100
+        print(f"Winning Trades        : {wins}")
+        print(f"Losing Trades         : {losses}")
+        print(f"Win Rate              : {win_rate:.2f}%")
+        print(f"Net Profit / Loss     : ${total_profit:.2f}")
+        breakeven_needed = (1 / (1 + PAYOUT_RATE)) * 100
+        print(f"Breakeven Win Rate    : {breakeven_needed:.2f}%")
+        if win_rate > breakeven_needed:
+            print("Status                : 🟢 PROFITABLE EDGE")
+        else:
+            print("Status                : 🔴 UNPROFITABLE")
+    else:
+        print("Status                : No trades triggered with MTF filters.")
+    print("=" * 55)
 
 if __name__ == "__main__":
-    run_adx_scaling_backtest()
+    run_backtest()

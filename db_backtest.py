@@ -5,10 +5,11 @@ import numpy as np
 DB_NAME = 'market_data.db'
 ASSET = 'EURUSD_otc'
 
-# Bollinger Band Strategy Parameters
-BB_PERIOD = 20         # Moving average period
-BB_STD = 2.0           # Standard deviation multiplier
-PAYOUT_RATE = 0.92     # 92% payout
+# Trend-Following Parameters
+EMA_FAST = 9
+EMA_SLOW = 21
+EMA_TREND = 50
+PAYOUT_RATE = 0.92     
 STAKE = 1.0
 
 def load_data_from_db():
@@ -21,61 +22,58 @@ def load_data_from_db():
     df.set_index('datetime', inplace=True)
     return df
 
-def calculate_bollinger_bands(df):
-    """Calculates Bollinger Bands and checks for extreme breakouts."""
-    # Middle Band (Simple Moving Average)
-    df['sma'] = df['close'].rolling(window=BB_PERIOD).mean()
-    
-    # Standard Deviation
-    df['std'] = df['close'].rolling(window=BB_PERIOD).std()
-    
-    # Upper and Lower Bands
-    df['upper_band'] = df['sma'] + (df['std'] * BB_STD)
-    df['lower_band'] = df['sma'] - (df['std'] * BB_STD)
-    
+def calculate_indicators(df):
+    # Trend-Following Moving Averages
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    df['ema_trend'] = df['close'].ewm(span=EMA_TREND, adjust=False).mean()
     return df
 
 def run_backtest():
     df = load_data_from_db()
-    if len(df) < BB_PERIOD + 2:
+    if len(df) < EMA_TREND + 2:
         print(f"Not enough data in database yet. Current rows: {len(df)}")
         return
 
-    print(f"Loaded {len(df)} candles from SQLite database. Running Bollinger Band Mean Reversion backtest...\n")
-    df = calculate_bollinger_bands(df)
+    print(f"Loaded {len(df)} candles from SQLite. Running Trend-Following backtest...\n")
+    df = calculate_indicators(df)
     
     wins = 0
     losses = 0
     total_profit = 0.0
     trades_executed = 0
 
-    # Start after the BB warmup period
-    start_index = BB_PERIOD
+    start_index = EMA_TREND
     
     for i in range(start_index, len(df) - 1):
+        prev_row = df.iloc[i - 1]
         current_row = df.iloc[i]
         next_row = df.iloc[i + 1]
         
-        close_price = current_row['close']
-        upper = current_row['upper_band']
-        lower = current_row['lower_band']
+        # Check EMA Crossover
+        fast_above_slow_now = current_row['ema_fast'] > current_row['ema_slow']
+        fast_above_slow_prev = prev_row['ema_fast'] > prev_row['ema_slow']
+        
+        bullish_cross = not fast_above_slow_prev and fast_above_slow_now
+        bearish_cross = fast_above_slow_prev and not fast_above_slow_now
+        
+        # Macro Trend Filter
+        above_macro_trend = current_row['close'] > current_row['ema_trend']
+        below_macro_trend = current_row['close'] < current_row['ema_trend']
         
         signal = None
         
-        # Mean Reversion Trigger:
-        # If price closes ABOVE the upper band, fade it with a PUT (expecting drop back inside)
-        if close_price > upper:
-            signal = "put"
-        # If price closes BELOW the lower band, fade it with a CALL (expecting bounce back inside)
-        elif close_price < lower:
+        # Trend-Following Rules
+        if bullish_cross and above_macro_trend:
             signal = "call"
+        elif bearish_cross and below_macro_trend:
+            signal = "put"
             
         if signal:
             trades_executed += 1
             next_is_green = next_row['close'] > next_row['open']
             next_is_red = next_row['close'] < next_row['open']
             
-            # Evaluate 1-minute expiration outcome
             if (signal == "call" and next_is_green) or (signal == "put" and next_is_red):
                 wins += 1
                 total_profit += (STAKE * PAYOUT_RATE)
@@ -83,10 +81,9 @@ def run_backtest():
                 losses += 1
                 total_profit -= STAKE
 
-    # Print Results Report
-    print("=" * 50)
-    print("   BOLLINGER BAND MEAN REVERSION BACKTEST REPORT   ")
-    print("=" * 50)
+    print("=" * 55)
+    print("      EMA TREND-FOLLOWING BACKTEST REPORT          ")
+    print("=" * 55)
     print(f"Asset Evaluated       : {ASSET}")
     print(f"Total Candles Scanned : {len(df)}")
     print(f"Total Trades Triggered: {trades_executed}")
@@ -103,8 +100,8 @@ def run_backtest():
         else:
             print("Status                : 🔴 UNPROFITABLE (Needs tuning)")
     else:
-        print("Status                : No trades triggered with current band settings.")
-    print("=" * 50)
+        print("Status                : No trades triggered with current filters.")
+    print("=" * 55)
 
 if __name__ == "__main__":
     run_backtest()
